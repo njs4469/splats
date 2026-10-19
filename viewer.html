@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Splat Viewer</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    #viewer { position: fixed; inset: 0; touch-action: none; cursor: grab; }
+    #viewer.dragging { cursor: grabbing; }
+    #status {
+      position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+      color: #aaa; font: 14px/1.4 system-ui, sans-serif; text-align: center; pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="viewer"></div>
+  <div id="status">Loading…</div>
+
+  <script type="module">
+    // Pinned version so an update never breaks your site. Check npmjs.com/package/@manycore/aholo-viewer for newer ones.
+    import {
+      createViewer, setViewerConfig, PerspectiveCamera, BackgroundMode,
+      Vector3, Color, SplatLoader, SplatUtils,
+    } from 'https://unpkg.com/@manycore/aholo-viewer@1.5.0';
+
+    // ---------- Settings from the URL ----------
+    // viewer.html?src=myscene.sog&cam=-1.5,-0.5,0&target=0,0,0&up=-y&bg=000000&spin=1
+    const p = new URLSearchParams(location.search);
+    const vec = (s, d) => (s ? s.split(',').map(Number) : d);
+    const SRC    = p.get('src') || 'https://holo-cos.aholo3d.cn/aholo-opensource/gs_file/bear/bear.3d71a266.sog';
+    const CAM    = vec(p.get('cam'), [-1.5, -0.5, 0]);
+    const TARGET = vec(p.get('target'), [0, 0, 0]);
+    const UP     = (p.get('up') || '-y') === 'y' ? [0, 1, 0] : [0, -1, 0]; // most 3DGS captures are -Y up
+    const BG     = p.get('bg') || '000000';
+    const SPIN   = p.get('spin') === '1'; // slow auto-rotate until someone touches it
+
+    const container = document.getElementById('viewer');
+    const status = document.getElementById('status');
+
+    async function main() {
+      const viewer = createViewer('splat-viewer', container, {});
+      const camera = new PerspectiveCamera(60, container.clientWidth / container.clientHeight, 0.1, 2000);
+      camera.up.set(...UP);
+
+      const resp = await fetch(SRC);
+      if (!resp.ok) throw new Error(`Couldn't download the splat (${resp.status}).`);
+      const buffer = await resp.arrayBuffer();
+      const data = await SplatLoader.parseSplatData(
+        SplatLoader.SplatFileType.SOG,
+        new Uint8Array(buffer),
+        SplatLoader.SplatPackType.Compressed,
+      );
+      const splat = await SplatUtils.createSplat(data);
+      viewer.getScene().add(splat);
+      viewer.setCamera(camera);
+
+      const hex = parseInt(BG, 16);
+      setViewerConfig(viewer, {
+        pipeline: {
+          Background: {
+            background: {
+              active: BackgroundMode.BasicBackground,
+              basic: { color: new Color(((hex >> 16) & 255) / 255, ((hex >> 8) & 255) / 255, (hex & 255) / 255) },
+            },
+            ground: { enabled: false },
+          },
+          Splatting: { enabled: true },
+          TAA: { enabled: false },
+        },
+      });
+
+      // ---------- Simple orbit controls (drag = rotate, wheel/pinch = zoom) ----------
+      const target = new Vector3(...TARGET);
+      const upY = UP[1]; // +1 or -1
+      const off = [CAM[0] - TARGET[0], CAM[1] - TARGET[1], CAM[2] - TARGET[2]];
+      let radius = Math.hypot(...off) || 2;
+      let theta = Math.atan2(off[0], off[2]);                    // around the up axis
+      let phi = Math.acos(Math.max(-1, Math.min(1, (off[1] * upY) / radius))); // from the up axis
+
+      let needsRender = true;
+      const render = () => { needsRender = true; };
+      viewer.requestRenderHandler = render;
+
+      function updateCamera() {
+        const s = Math.sin(phi);
+        camera.position.set(
+          target.x + radius * s * Math.sin(theta),
+          target.y + radius * Math.cos(phi) * upY,
+          target.z + radius * s * Math.cos(theta),
+        );
+        camera.lookAt(target);
+        render();
+      }
+
+      const pointers = new Map();
+      let lastPinch = 0, spinning = SPIN;
+
+      container.addEventListener('pointerdown', (e) => {
+        spinning = false;
+        container.setPointerCapture(e.pointerId);
+        pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        container.classList.add('dragging');
+      });
+      container.addEventListener('pointermove', (e) => {
+        const prev = pointers.get(e.pointerId);
+        if (!prev) return;
+        if (pointers.size === 1) {
+          theta -= ((e.clientX - prev.x) / container.clientWidth) * Math.PI * 2 * upY;
+          phi = Math.max(0.05, Math.min(Math.PI - 0.05, phi - ((e.clientY - prev.y) / container.clientHeight) * Math.PI * upY));
+        }
+        pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (pointers.size === 2) {
+          const [a, b] = [...pointers.values()];
+          const d = Math.hypot(a.x - b.x, a.y - b.y);
+          if (lastPinch) radius = Math.max(0.1, radius * (lastPinch / d));
+          lastPinch = d;
+        }
+        updateCamera();
+      });
+      const endPointer = (e) => {
+        pointers.delete(e.pointerId);
+        if (pointers.size < 2) lastPinch = 0;
+        if (!pointers.size) container.classList.remove('dragging');
+      };
+      container.addEventListener('pointerup', endPointer);
+      container.addEventListener('pointercancel', endPointer);
+      container.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        spinning = false;
+        radius = Math.max(0.1, radius * Math.exp(e.deltaY * 0.001));
+        updateCamera();
+      }, { passive: false });
+
+      window.addEventListener('resize', () => {
+        camera.aspect = container.clientWidth / container.clientHeight;
+        camera.updateProjectionMatrix?.();
+        render();
+      });
+
+      function loop() {
+        if (spinning) { theta += 0.003; updateCamera(); }
+        if (needsRender) { needsRender = false; viewer.render(); }
+        requestAnimationFrame(loop);
+      }
+      updateCamera();
+      status.remove();
+      loop();
+    }
+
+    main().catch((err) => {
+      console.error(err);
+      status.textContent = 'Could not load this 3D scene. ' + (err.message || '');
+    });
+  </script>
+</body>
+</html>
